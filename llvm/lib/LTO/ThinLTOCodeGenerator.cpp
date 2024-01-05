@@ -1621,7 +1621,15 @@ void ThinLTOCodeGenerator::run() {
 
   // Parallel optimizer + codegen
   {
-    ThreadPool Pool(heavyweight_hardware_concurrency(ThreadCount));
+    // Limit the parallelism of compute-heavy tasks...
+    int AvailableComputeTaskSlots =
+        heavyweight_hardware_concurrency(ThreadCount).compute_thread_count();
+    std::mutex Mutex;
+    std::condition_variable CondVar;
+
+    // ...but parallelize IO-heavy tasks as much as possible.
+    ThreadPool Pool(hardware_concurrency(Modules.size()));
+
     for (auto IndexCount : ModulesOrdering) {
       auto &Mod = Modules[IndexCount];
       Pool.async([&](int count) {
@@ -1704,6 +1712,14 @@ void ThinLTOCodeGenerator::run() {
         saveTempBitcode(*TheModule, SaveTempsDir, count, ".0.original.bc");
 
         auto &ImportList = ImportLists[ModuleIdentifier];
+
+        // Wait for a compute-heavy task slot and acquire it.
+        {
+          std::unique_lock Lock(Mutex);
+          CondVar.wait(Lock, [&] { return AvailableComputeTaskSlots > 0; });
+          --AvailableComputeTaskSlots;
+        }
+
         // Run the main process now, and generates a binary
         auto OutputBuffer = ProcessThinLTOModule(
             *TheModule, *Index, ModuleMap, *TMBuilder.create(), ImportList,
@@ -1711,6 +1727,13 @@ void ThinLTOCodeGenerator::run() {
             ModuleToDefinedGVSummaries[ModuleIdentifier], CacheOptions,
             DisableCodeGen, SaveTempsDir, Freestanding, OptLevel, count,
             DebugPassManager);
+
+        // Release the compute-heavy task slot.
+        {
+          std::lock_guard Lock(Mutex);
+          ++AvailableComputeTaskSlots;
+        }
+        CondVar.notify_one();
 
         if (CacheLogging)
           CacheLogOS.applyLocked([&](raw_ostream &OS) {
